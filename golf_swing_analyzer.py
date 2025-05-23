@@ -42,18 +42,32 @@ class GolfSwingAnalyzer:
             
         return angle
 
-    def calculate_club_speed(self, positions, fps):
-        """Calculate club head speed from positions."""
-        if len(positions) < 2:
-            return 0
-        
-        # Calculate distance between last two points
-        p1 = np.array(positions[-2])
-        p2 = np.array(positions[-1])
+    def calculate_club_speed(self, positions, fps, smoothing_window=3):
+        """Calculate club head speed from positions using a moving average."""
+        if len(positions) < smoothing_window * 2: # Need enough points for two averaged positions
+            if len(positions) < 2:
+                return 0
+            # Fallback for fewer points than full smoothing
+            p1 = np.array(positions[-2])
+            p2 = np.array(positions[-1])
+        else:
+            # Calculate average of the last 'smoothing_window' points
+            current_points = np.array(positions[-smoothing_window:])
+            p2 = np.mean(current_points, axis=0)
+            
+            # Calculate average of the 'smoothing_window' points before the last ones
+            previous_points = np.array(positions[-(smoothing_window * 2):-smoothing_window])
+            p1 = np.mean(previous_points, axis=0)
+
         distance = np.linalg.norm(p2 - p1)  # pixels
         
-        # Convert to speed (pixels per second)
-        speed = distance * fps
+        # Time interval for speed calculation:
+        # If using full smoothing, it's over 'smoothing_window' frames.
+        # Otherwise, it's over 1 frame.
+        time_interval = smoothing_window / fps if len(positions) >= smoothing_window * 2 else 1.0 / fps
+        if time_interval == 0: return 0 # Avoid division by zero
+
+        speed = distance / time_interval # pixels per second
         
         # You might want to convert pixels to real-world units here
         # This would require calibration with known distances
@@ -61,30 +75,43 @@ class GolfSwingAnalyzer:
 
     def detect_club_head(self, frame):
         """Detect club head using color and shape."""
-        # Convert to HSV color space
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
-        # Define range for silver/metallic color (adjust these values based on your club)
-        lower = np.array([0, 0, 150])
-        upper = np.array([180, 30, 255])
+        # Refined HSV range for silver/grey colors
+        lower_grey = np.array([0, 0, 40])   # Adjusted min value slightly lower for darker greys
+        upper_grey = np.array([180, 60, 230]) # Adjusted max saturation and value
         
-        # Create mask for metallic colors
-        mask = cv2.inRange(hsv, lower, upper)
+        mask = cv2.inRange(hsv, lower_grey, upper_grey)
         
-        # Apply morphological operations to remove noise
         kernel = np.ones((5,5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         
-        # Find contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
+        best_bbox = None
+        best_contour_area = 0
+
         if contours:
-            # Get the largest contour
-            largest_contour = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(largest_contour) > 100:  # Minimum area threshold
-                x, y, w, h = cv2.boundingRect(largest_contour)
-                return (x, y, w, h)
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                
+                if area > 100:  # Minimum area threshold
+                    x, y, w, h = cv2.boundingRect(contour)
+                    aspect_ratio = w / float(h) if h > 0 else 0
+                    
+                    # Solidity: contour area / convex hull area
+                    hull = cv2.convexHull(contour)
+                    hull_area = cv2.contourArea(hull)
+                    solidity = area / float(hull_area) if hull_area > 0 else 0
+                    
+                    # Filter based on aspect ratio and solidity
+                    if 0.2 < aspect_ratio < 5.0 and solidity > 0.80:
+                        if area > best_contour_area: # Pick the largest valid contour
+                            best_contour_area = area
+                            best_bbox = (x, y, w, h)
+            
+            return best_bbox # This will be None if no contour passes the criteria
         
         return None
 
@@ -213,6 +240,18 @@ class GolfSwingAnalyzer:
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
                 cv2.putText(image, f'Knee Flex: {int(left_knee_angle)}deg',
                            (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+                # Calculate shoulder rotation
+                shoulder_angle = math.degrees(math.atan2(right_shoulder[1] - left_shoulder[1],
+                                                         right_shoulder[0] - left_shoulder[0]))
+                cv2.putText(image, f'Shoulder Rotation: {int(shoulder_angle)}deg',
+                           (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+                # Calculate hip rotation
+                hip_angle = math.degrees(math.atan2(right_hip[1] - left_hip[1],
+                                                    right_hip[0] - left_hip[0]))
+                cv2.putText(image, f'Hip Rotation: {int(hip_angle)}deg',
+                           (10, 190), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
             out.write(image)
 
