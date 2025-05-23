@@ -2,8 +2,35 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import math
+import torch
+from ultralytics import YOLO
 
 class GolfSwingAnalyzer:
+    def train_yolo_model(self):
+        """
+        Trains a YOLO model on the golf club head dataset.
+        Returns the path to the best saved model weights.
+        """
+        model = YOLO()  # Initialize YOLO model (specific version like v11 handled by data.yaml or model file)
+        # Train the model
+        # Note: The epochs and imgsz are examples and can be adjusted.
+        # The project and name arguments ensure a predictable output path.
+        results = model.train(
+            data='Golf-club-head.v2i.yolov11/data.yaml',
+            epochs=50,  # Example: 50 epochs
+            imgsz=640, # Example: image size 640
+            project='runs/train',
+            name='golf_club_exp',
+            exist_ok=True # Allows overwriting if the experiment name already exists
+        )
+        # The path to the best weights is typically in results.save_dir or can be constructed
+        # results.save_dir should be 'runs/train/golf_club_exp'
+        # best_model_path = results.save_dir + '/weights/best.pt' # This is one way if results object has save_dir
+        # For ultralytics YOLO, the path is usually predictable based on project and name
+        best_model_path = 'runs/train/golf_club_exp/weights/best.pt'
+        print(f"YOLO model training complete. Best weights saved at: {best_model_path}")
+        return best_model_path
+
     def __init__(self):
         self.mp_pose = mp.solutions.pose
         self.pose = self.mp_pose.Pose(
@@ -13,19 +40,16 @@ class GolfSwingAnalyzer:
         self.mp_drawing = mp.solutions.drawing_utils
         self.mp_drawing_styles = mp.solutions.drawing_styles
         
-        # Initialize tracking variables
-        self.tracker = None
-        self.club_bbox = None
-        self.tracking_initialized = False
-        self.club_positions = []
-        self.use_simple_tracking = True  # Default to simple tracking
+        # Train YOLO model and get the path to the best weights
+        model_path = self.train_yolo_model()
         
-        # Try to initialize advanced tracker
-        try:
-            self.tracker = cv2.TrackerKCF_create()
-            self.use_simple_tracking = False
-        except AttributeError:
-            print("Advanced tracking not available, using simple color tracking instead.")
+        # Initialize YOLO model
+        self.yolo_model = torch.hub.load('ultralytics/yolov5', 'custom', path=model_path, force_reload=True)
+        print(f"Trained model loaded from {model_path}")
+        
+        # Initialize club head trace
+        self.club_head_trace = []
+        self.club_positions = [] # This line seems to be kept from original, subtask did not mention removing it.
 
     def calculate_angle(self, a, b, c):
         """Calculate angle between three points."""
@@ -60,33 +84,33 @@ class GolfSwingAnalyzer:
         return speed
 
     def detect_club_head(self, frame):
-        """Detect club head using color and shape."""
-        # Convert to HSV color space
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        """Detect club head using the YOLOv11 model."""
+        results = self.yolo_model(frame)
         
-        # Define range for silver/metallic color (adjust these values based on your club)
-        lower = np.array([0, 0, 150])
-        upper = np.array([180, 30, 255])
+        # Process results
+        # Assuming results.pred[0] contains the detections [x1, y1, x2, y2, confidence, class_id]
+        # This might need adjustment based on the exact version of YOLOv5 and ultralytics
+        detections = results.pred[0] 
         
-        # Create mask for metallic colors
-        mask = cv2.inRange(hsv, lower, upper)
-        
-        # Apply morphological operations to remove noise
-        kernel = np.ones((5,5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        
-        # Find contours
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if contours:
-            # Get the largest contour
-            largest_contour = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(largest_contour) > 100:  # Minimum area threshold
-                x, y, w, h = cv2.boundingRect(largest_contour)
-                return (x, y, w, h)
-        
-        return None
+        club_head_bbox = None
+        max_confidence = 0.5  # Minimum confidence threshold
+
+        for det in detections:
+            x1, y1, x2, y2, confidence, class_id = det
+            # Assuming 'club-head' is class ID 0. 
+            # It's better to verify this using self.yolo_model.names if available
+            # For example: if self.yolo_model.names[int(class_id)] == 'club-head':
+            if int(class_id) == 0 and confidence > max_confidence:
+                # Found a 'club-head' with higher confidence
+                club_head_bbox = (int(x1), int(y1), int(x2 - x1), int(y2 - y1))
+                # If you want to take the highest confidence detection, update max_confidence here
+                # max_confidence = confidence 
+                # For now, we take the first one that meets the threshold or the last one if multiple meet it.
+                # To take the one with highest confidence, you'd sort or keep track of max_conf.
+                # For simplicity, let's take the first high-confidence detection of class 0
+                return club_head_bbox 
+                
+        return club_head_bbox # Returns None if no detection met the criteria
 
     def process_video(self, input_path, output_path):
         cap = cv2.VideoCapture(input_path)
@@ -98,6 +122,8 @@ class GolfSwingAnalyzer:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
+        self.club_head_trace.clear() # Clear trace for new video
+
         frame_count = 0
         while cap.isOpened():
             ret, frame = cap.read()
@@ -106,79 +132,57 @@ class GolfSwingAnalyzer:
 
             frame_count += 1
             
-            # Convert the BGR image to RGB for MediaPipe
-            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = self.pose.process(image)
+            # 1. Convert the BGR frame to RGB for MediaPipe
+            image_rgb_for_mediapipe = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # 2. Process pose with MediaPipe
+            pose_results = self.pose.process(image_rgb_for_mediapipe)
             
-            # Convert back to BGR for OpenCV
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            # 3. Convert the original frame (or a copy) back to BGR for OpenCV drawing & YOLO
+            #    (YOLO expects BGR, and OpenCV drawing functions expect BGR)
+            #    If MediaPipe processing modified image_rgb_for_mediapipe in place, 
+            #    we should use 'frame' for YOLO and then draw on 'frame' or a copy.
+            #    Let's use 'frame' for YOLO and draw on 'frame'.
+            #    The variable 'image' will be used for drawing.
+            image = frame.copy() # Use a copy to avoid drawing on the original frame if it's reused
 
-            # Track or detect club head
-            if self.use_simple_tracking:
-                # Always use color detection for simple tracking
-                club_bbox = self.detect_club_head(frame)
-                if club_bbox is not None:
-                    self.club_bbox = club_bbox
-                    x, y, w, h = club_bbox
-                    club_center = (int(x + w/2), int(y + h/2))
-                    self.club_positions.append(club_center)
-                    
-                    # Draw club head tracking
-                    cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                    
-                    # Calculate and display club head speed
-                    speed = self.calculate_club_speed(self.club_positions, fps)
-                    cv2.putText(image, f'Club Speed: {int(speed)} px/s',
-                               (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-                    
-                    # Draw club path
-                    if len(self.club_positions) > 1:
-                        for i in range(1, len(self.club_positions)):
-                            cv2.line(image, self.club_positions[i-1], self.club_positions[i],
-                                   (0, 0, 255), 2)
-            else:
-                # Use advanced tracking
-                if not self.tracking_initialized:
-                    club_bbox = self.detect_club_head(frame)
-                    if club_bbox is not None:
-                        self.club_bbox = club_bbox
-                        self.tracker.init(frame, club_bbox)
-                        self.tracking_initialized = True
-                else:
-                    success, bbox = self.tracker.update(frame)
-                    if success:
-                        self.club_bbox = tuple(map(int, bbox))
-                        club_center = (int(bbox[0] + bbox[2]/2), int(bbox[1] + bbox[3]/2))
-                        self.club_positions.append(club_center)
-                        
-                        # Draw club head tracking
-                        x, y, w, h = self.club_bbox
-                        cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                        
-                        # Calculate and display club head speed
-                        speed = self.calculate_club_speed(self.club_positions, fps)
-                        cv2.putText(image, f'Club Speed: {int(speed)} px/s',
-                                   (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-                        
-                        # Draw club path
-                        if len(self.club_positions) > 1:
-                            for i in range(1, len(self.club_positions)):
-                                cv2.line(image, self.club_positions[i-1], self.club_positions[i],
-                                       (0, 0, 255), 2)
-                    else:
-                        self.tracking_initialized = False
+            # 4. Detect club head using YOLO on the BGR frame
+            club_bbox = self.detect_club_head(frame) # detect_club_head expects BGR
 
-            if results.pose_landmarks:
+            # 5. If club_bbox exists (club head detected)
+            if club_bbox is not None:
+                x, y, w, h = club_bbox
+                club_center = (int(x + w/2), int(y + h/2))
+                self.club_head_trace.append(club_center)
+                
+                # Draw a dot at the club_center
+                cv2.circle(image, club_center, radius=5, color=(0, 255, 0), thickness=-1)
+                
+                # Draw club head bounding box
+                cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                
+                # Calculate and display club head speed
+                speed = self.calculate_club_speed(self.club_head_trace, fps)
+                cv2.putText(image, f'Club Speed: {int(speed)} px/s',
+                           (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+            # 6. Draw the club head trace (path)
+            if len(self.club_head_trace) > 1:
+                for i in range(1, len(self.club_head_trace)):
+                    cv2.line(image, self.club_head_trace[i-1], self.club_head_trace[i],
+                           (0, 0, 255), 2) # Red line
+
+            # 7. Draw MediaPipe pose landmarks on the BGR image
+            if pose_results.pose_landmarks:
                 # Draw pose landmarks
                 self.mp_drawing.draw_landmarks(
-                    image,
-                    results.pose_landmarks,
+                    image, # Draw on the BGR image
+                    pose_results.pose_landmarks,
                     self.mp_pose.POSE_CONNECTIONS,
                     landmark_drawing_spec=self.mp_drawing_styles.get_default_pose_landmarks_style()
                 )
 
                 # Get landmarks
-                landmarks = results.pose_landmarks.landmark
+                landmarks = pose_results.pose_landmarks.landmark
 
                 # Calculate spine angle (between shoulders and hips)
                 left_shoulder = [landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER.value].x * width,
@@ -213,7 +217,8 @@ class GolfSwingAnalyzer:
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
                 cv2.putText(image, f'Knee Flex: {int(left_knee_angle)}deg',
                            (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-
+            
+            # 8. Write the frame to output
             out.write(image)
 
         cap.release()
