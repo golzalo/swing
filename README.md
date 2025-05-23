@@ -28,7 +28,7 @@ output_video = "analyzed_swing.mp4"
 ```
 3. Run the script:
 ```bash
-python golf_swing_analyzer.py
+python3 golf_swing_analyzer.py
 ```
 
 ## Measurements

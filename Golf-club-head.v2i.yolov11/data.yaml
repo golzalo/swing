@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['club head']
+
+roboflow:
+  workspace: jonathan-tidbury-kt5x7
+  project: golf-club-head
+  version: 2
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/jonathan-tidbury-kt5x7/golf-club-head/dataset/2
